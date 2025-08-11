@@ -12,7 +12,26 @@ from src.routes.repairs import repairs_bp
 from src.routes.admin import admin_bp
 
 app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), 'static'))
-app.config['SECRET_KEY'] = 'asdf#FGSgvasgf$5$WGT'
+import os
+from datetime import timedelta
+from flask_cors import CORS
+
+# Clé secrète depuis l'environnement (Render)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret')
+
+# Autoriser le front Netlify à envoyer/recevoir le cookie de session
+NETLIFY_ORIGIN = "https://reparetout.netlify.app"   # ← remplace si ton URL Netlify est différente
+CORS(app,
+     supports_credentials=True,
+     resources={r"/api/*": {"origins": [NETLIFY_ORIGIN]}})
+
+# Cookies de session compatibles cross-site (Netlify → Render)
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SECURE=True,
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+)
+
 
 # Configuration CORS
 CORS(app, supports_credentials=True)
