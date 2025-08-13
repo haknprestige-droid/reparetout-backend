@@ -1,235 +1,170 @@
-from flask import Blueprint, request, jsonify, session
-from src.models.user import db, User, RepairRequest, Quote
-from src.services.email_service import email_service
+import os
+from uuid import uuid4
 from datetime import datetime
+from flask import Blueprint, request, jsonify, session, current_app
+from werkzeug.utils import secure_filename
 
-repairs_bp = Blueprint('repairs', __name__)
+from src.models.user import db, User, RepairRequest  # + Quote si besoin (pas ici)
 
-@repairs_bp.route('/requests', methods=['GET'])
-def get_repair_requests():
+repairs_bp = Blueprint("repairs", __name__)
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+ALLOWED_EXT = {"jpg", "jpeg", "png", "webp"}
+MAX_BYTES = 3 * 1024 * 1024  # ~3 Mo
+
+def _ensure_upload_dir():
+    updir = current_app.config.get("UPLOAD_DIR")
+    if not updir:
+        # dossier fallback si non configuré dans main.py
+        updir = os.path.join(os.path.dirname(current_app.root_path), "static", "uploads")
+        os.makedirs(updir, exist_ok=True)
+        current_app.config["UPLOAD_DIR"] = updir
+    return updir
+
+def _parse_budget(value: str) -> float:
+    if not value:
+        return 0.0
+    v = str(value).strip().replace("€", "").replace(" ", "").replace(",", ".")
     try:
-        # Paramètres de filtrage
-        category = request.args.get('category')
-        city = request.args.get('city')
-        status = request.args.get('status', 'open')
-        search = request.args.get('search', '')
-        
-        query = RepairRequest.query
-        
-        # Filtres
-        if category and category != 'all':
-            query = query.filter(RepairRequest.category == category)
-        
-        if city:
-            query = query.filter(RepairRequest.city.ilike(f'%{city}%'))
-        
-        if status != 'all':
-            query = query.filter(RepairRequest.status == status)
-        
-        if search:
-            query = query.filter(
-                db.or_(
-                    RepairRequest.title.ilike(f'%{search}%'),
-                    RepairRequest.description.ilike(f'%{search}%')
-                )
-            )
-        
-        # Ordre par date de création (plus récent en premier)
-        requests = query.order_by(RepairRequest.created_at.desc()).all()
-        
-        return jsonify({
-            'requests': [req.to_dict() for req in requests],
-            'total': len(requests)
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': 'Erreur lors de la récupération des demandes'}), 500
+        return round(float(v), 2)
+    except Exception:
+        return 0.0
 
-@repairs_bp.route('/requests', methods=['POST'])
-def create_repair_request():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Connexion requise'}), 401
-    
+def _require_login():
+    if "user_id" not in session:
+        return jsonify({"error": "Connexion requise"}), 401
+    user = User.query.get(session["user_id"])
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 401
+    return user
+
+# ---------------------------------------------------------------------
+# POST /api/repairs/requests : créer une demande avec photo (FormData)
+# ---------------------------------------------------------------------
+
+@repairs_bp.route("/requests", methods=["POST"])
+def create_request():
+    user = _require_login()
+    if not isinstance(user, User):
+        return user  # (json, status) de _require_login
+
     try:
-        data = request.get_json()
-        
-        # Validation
-        required_fields = ['title', 'description', 'category', 'city']
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({'error': f'Le champ {field} est obligatoire'}), 400
-        
-        # Créer la demande
-        repair_request = RepairRequest(
-            title=data['title'],
-            description=data['description'],
-            category=data['category'],
-            subcategory=data.get('subcategory'),
-            city=data['city'],
-            address=data.get('address'),
-            latitude=data.get('latitude'),
-            longitude=data.get('longitude'),
-            budget_min=data.get('budget_min'),
-            budget_max=data.get('budget_max'),
-            visibility=data.get('visibility', 'public'),
-            client_id=session['user_id']
+        title = (request.form.get("title") or "").strip()
+        description = (request.form.get("description") or "").strip()
+        category = (request.form.get("category") or "").strip()  # ex: "electronics"
+        city = (request.form.get("city") or "").strip()
+        budget = _parse_budget(request.form.get("budget"))
+
+        # validations simples
+        if not title or not description or not category or not city:
+            return jsonify({"error": "Champs manquants"}), 400
+
+        # fichier
+        file = request.files.get("photo")
+        if not file or file.filename == "":
+            return jsonify({"error": "Photo obligatoire"}), 400
+
+        filename = secure_filename(file.filename)
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in ALLOWED_EXT:
+            return jsonify({"error": "Format image non supporté (jpg, jpeg, png, webp)"}), 415
+
+        # limite taille (si l’en-tête est présent) — le backend Render coupe parfois, donc on garde souple
+        clen = request.content_length or 0
+        if clen and clen > MAX_BYTES + 512_000:  # petite marge
+            return jsonify({"error": "Image trop volumineuse (> 3 Mo)"}), 413
+
+        # enregistrer le fichier
+        updir = _ensure_upload_dir()
+        unique = f"{uuid4().hex}.{ext}"
+        dst = os.path.join(updir, unique)
+        file.save(dst)
+
+        # chemin public (servi par /static/uploads/... sur Netlify ou Render)
+        public_path = f"/static/uploads/{unique}"
+
+        # créer l’objet SQLAlchemy
+        rr = RepairRequest(
+            title=title,
+            description=description,
+            category=category,
+            city=city,
+            status="open",
+            user_id=user.id,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
         )
-        
-        db.session.add(repair_request)
+
+        # budget unique → on remplit ce qui existe dans le modèle
+        if hasattr(RepairRequest, "budget"):
+            rr.budget = budget
+        if hasattr(RepairRequest, "budget_min"):
+            rr.budget_min = budget
+        if hasattr(RepairRequest, "budget_max"):
+            rr.budget_max = budget
+
+        # image/chemin (selon nom de colonne)
+        if hasattr(RepairRequest, "image"):
+            rr.image = public_path
+        elif hasattr(RepairRequest, "photo_url"):
+            rr.photo_url = public_path
+        elif hasattr(RepairRequest, "image_url"):
+            rr.image_url = public_path
+
+        db.session.add(rr)
         db.session.commit()
-        
-        # Notifier les réparateurs pertinents
-        try:
-            repairers = User.query.filter_by(role='repairer', status='active').all()
-            if repairers:
-                email_service.send_new_request_notification(repair_request, repairers)
-        except Exception as e:
-            print(f"Erreur envoi notification réparateurs: {e}")
-        
-        # Notifier l'admin
-        try:
-            email_service.send_admin_alert(
-                "Nouvelle demande de réparation",
-                f"Nouvelle demande créée par {repair_request.client.username}: {repair_request.title}"
-            )
-        except Exception as e:
-            print(f"Erreur notification admin: {e}")
-        
-        return jsonify({
-            'message': 'Demande créée avec succès',
-            'request': repair_request.to_dict()
-        }), 201
-        
+
+        # to_dict() si dispo, sinon JSON minimal
+        if hasattr(rr, "to_dict"):
+            payload = rr.to_dict()
+        else:
+            payload = {
+                "id": rr.id,
+                "title": rr.title,
+                "description": rr.description,
+                "category": rr.category,
+                "city": rr.city,
+                "budget": getattr(rr, "budget", None),
+                "budget_min": getattr(rr, "budget_min", None),
+                "budget_max": getattr(rr, "budget_max", None),
+                "image": getattr(rr, "image", None) or getattr(rr, "photo_url", None) or getattr(rr, "image_url", None),
+                "status": rr.status,
+                "user_id": rr.user_id,
+                "created_at": rr.created_at.isoformat() if rr.created_at else None,
+            }
+
+        return jsonify({"message": "Demande créée", "request": payload}), 201
+
     except Exception as e:
+        current_app.logger.exception("Erreur création demande")
         db.session.rollback()
-        return jsonify({'error': 'Erreur lors de la création de la demande'}), 500
+        # 500 → fera apparaître un 502 côté proxy si l’erreur n’est pas catchée.
+        return jsonify({"error": "Erreur serveur pendant la création"}), 500
 
-@repairs_bp.route('/requests/<int:request_id>', methods=['GET'])
-def get_repair_request(request_id):
-    try:
-        repair_request = RepairRequest.query.get_or_404(request_id)
-        return jsonify({'request': repair_request.to_dict()}), 200
-    except Exception as e:
-        return jsonify({'error': 'Demande introuvable'}), 404
 
-@repairs_bp.route('/requests/<int:request_id>/quotes', methods=['POST'])
-def create_quote(request_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Connexion requise'}), 401
-    
-    try:
-        # Vérifier que l'utilisateur est un réparateur
-        user = User.query.get(session['user_id'])
-        if user.role not in ['repairer', 'admin']:
-            return jsonify({'error': 'Seuls les réparateurs peuvent faire des devis'}), 403
-        
-        repair_request = RepairRequest.query.get_or_404(request_id)
-        
-        if repair_request.status != 'open':
-            return jsonify({'error': 'Cette demande n\'accepte plus de devis'}), 400
-        
-        data = request.get_json()
-        
-        # Validation
-        if not data.get('price') or not data.get('estimated_duration'):
-            return jsonify({'error': 'Prix et durée estimée sont obligatoires'}), 400
-        
-        # Créer le devis
-        quote = Quote(
-            repair_request_id=request_id,
-            repairer_id=session['user_id'],
-            price=int(data['price'] * 100),  # Convertir en centimes
-            estimated_duration=data['estimated_duration'],
-            conditions=data.get('conditions', ''),
-            location_type=data.get('location_type', 'domicile')
-        )
-        
-        db.session.add(quote)
-        
-        # Mettre à jour le statut de la demande
-        if repair_request.status == 'open':
-            repair_request.status = 'quoted'
-        
-        db.session.commit()
-        
-        # Notifier le client du nouveau devis
-        try:
-            email_service.send_quote_notification(quote)
-        except Exception as e:
-            print(f"Erreur envoi notification devis: {e}")
-        
-        return jsonify({
-            'message': 'Devis envoyé avec succès',
-            'quote': quote.to_dict()
-        }), 201
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': 'Erreur lors de l\'envoi du devis'}), 500
+# ---------------------------------------------------------------------
+# GET /api/repairs/requests/mine : lister mes demandes
+# ---------------------------------------------------------------------
+@repairs_bp.route("/requests/mine", methods=["GET"])
+def my_requests():
+    user = _require_login()
+    if not isinstance(user, User):
+        return user
 
-@repairs_bp.route('/quotes/<int:quote_id>/accept', methods=['POST'])
-def accept_quote(quote_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Connexion requise'}), 401
-    
-    try:
-        quote = Quote.query.get_or_404(quote_id)
-        repair_request = quote.repair_request
-        
-        # Vérifier que l'utilisateur est le client de la demande
-        if repair_request.client_id != session['user_id']:
-            return jsonify({'error': 'Non autorisé'}), 403
-        
-        # Accepter le devis
-        quote.status = 'accepted'
-        repair_request.accepted_quote_id = quote_id
-        repair_request.status = 'accepted'
-        
-        # Rejeter les autres devis
-        other_quotes = Quote.query.filter_by(repair_request_id=repair_request.id).filter(Quote.id != quote_id).all()
-        for other_quote in other_quotes:
-            other_quote.status = 'rejected'
-        
-        db.session.commit()
-        
-        # Notifier les parties concernées
-        try:
-            email_service.send_quote_accepted_notification(quote)
-        except Exception as e:
-            print(f"Erreur envoi notification acceptation: {e}")
-        
-        return jsonify({
-            'message': 'Devis accepté',
-            'quote': quote.to_dict()
-        }), 200
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': 'Erreur lors de l\'acceptation du devis'}), 500
-
-@repairs_bp.route('/my-requests', methods=['GET'])
-def get_my_requests():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Connexion requise'}), 401
-    
-    try:
-        requests = RepairRequest.query.filter_by(client_id=session['user_id']).order_by(RepairRequest.created_at.desc()).all()
-        return jsonify({
-            'requests': [req.to_dict() for req in requests]
-        }), 200
-    except Exception as e:
-        return jsonify({'error': 'Erreur lors de la récupération des demandes'}), 500
-
-@repairs_bp.route('/my-quotes', methods=['GET'])
-def get_my_quotes():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Connexion requise'}), 401
-    
-    try:
-        quotes = Quote.query.filter_by(repairer_id=session['user_id']).order_by(Quote.created_at.desc()).all()
-        return jsonify({
-            'quotes': [quote.to_dict() for quote in quotes]
-        }), 200
-    except Exception as e:
-        return jsonify({'error': 'Erreur lors de la récupération des devis'}), 500
-
+    q = RepairRequest.query.filter_by(user_id=user.id).order_by(RepairRequest.created_at.desc())
+    items = []
+    for r in q.all():
+        if hasattr(r, "to_dict"):
+            items.append(r.to_dict())
+        else:
+            items.append({
+                "id": r.id,
+                "title": r.title,
+                "status": r.status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "image": getattr(r, "image", None) or getattr(r, "photo_url", None) or getattr(r, "image_url", None),
+            })
+    return jsonify({"items": items}), 200
